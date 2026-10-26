@@ -2,13 +2,14 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone, date
+from uuid import uuid4
 from typing import Literal
 
 from app.connectors.open_meteo import fetch_daily_history
 from app.features.climate import summarize_10y_daily, drought_risk_from_rainfall, aridity_class
 from app.recommendations.tunisia import build_recommendations_tn
 
-app = FastAPI(title="Tunisia GeoAI MVP", version="0.5.0")
+app = FastAPI(title="Tunisia GeoAI MVP", version="0.6.0")
 
 
 # ----------------------------
@@ -55,11 +56,9 @@ def validate_point_in_tunisia(lat: float, lon: float) -> None:
         )
 
 def _date_10y_window_end_today() -> tuple[str, str]:
-    end_d = date.today()
-    try:
-        start_d = date(end_d.year - 10, end_d.month, end_d.day)
-    except ValueError:
-        start_d = date(end_d.year - 10, end_d.month, 28)
+    # Ten complete calendar years avoid partial years and the archive publication delay.
+    end_d = date(datetime.now(timezone.utc).year - 1, 12, 31)
+    start_d = date(end_d.year - 9, 1, 1)
     return start_d.isoformat(), end_d.isoformat()
 
 def salinity_risk_from_soil_ec(ec: float | None) -> str:
@@ -124,7 +123,7 @@ def build_risks(indicators: dict, constraints: dict, soil: dict | None) -> list[
     # Heat stress
     risks.append({
         "type": "HEAT",
-        "level": "HIGH" if (indicators.get("hot_days_ge_40_per_year_est", 0) or 0) > 30 else "MEDIUM",
+        "level": "UNKNOWN" if indicators.get("hot_days_ge_40_per_year_est") is None else "HIGH" if indicators["hot_days_ge_40_per_year_est"] > 30 else "MEDIUM" if indicators["hot_days_ge_40_per_year_est"] > 10 else "LOW",
         "evidence": [
             f"hot_days_ge_35_per_year_est={indicators.get('hot_days_ge_35_per_year_est')}",
             f"hot_days_ge_40_per_year_est={indicators.get('hot_days_ge_40_per_year_est')}",
@@ -167,6 +166,8 @@ async def site_analysis(req: AnalyzeRequest):
     )
     daily = raw.get("daily") or {}
     climate = summarize_10y_daily(daily)
+    if climate.get("error") or climate.get("period_days", 0) < 3650:
+        raise HTTPException(502, "Climate coverage is insufficient for agricultural screening. Please retry later.")
 
     # Drought risks
     drought = drought_risk_from_rainfall(
@@ -207,14 +208,15 @@ async def site_analysis(req: AnalyzeRequest):
     recs = build_recommendations_tn(indicators, constraints_dump, soil=soil_dump)
 
     # Confidence (simple MVP)
-    conf = "MEDIUM"
+    conf = "LOW"  # Uncalibrated crop rules and point climate cannot certify a parcel.
     if req.constraints.irrigation_available is None:
         conf = "LOW"
     if req.constraints.irrigation_available is True and req.constraints.water_ec_dS_m is None:
         conf = "LOW"  # missing critical info
 
     return {
-        "report_id": f"rep_{int(datetime.now().timestamp())}",
+        "report_id": f"rep_{uuid4().hex}",
+        "model_version": "tn-screening-0.6",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "site": req.site.model_dump(),
         "constraints": req.constraints.model_dump(),
@@ -223,17 +225,17 @@ async def site_analysis(req: AnalyzeRequest):
                 "type": "weather_history",
                 "provider": "open-meteo",
                 "range": f"{start_date}..{end_date}",
-                "kind": "measured/derived"
+                "kind": "modeled/reanalysis-derived"
             },
             {
                 "type": "soil_test",
                 "provider": "user",
-                "kind": "measured" if soil_ec is not None else "missing"
+                "kind": "user-entered" if req.soil_test and (req.soil_test.ph is not None or soil_ec is not None) else "missing"
             },
             {
                 "type": "water_test",
                 "provider": "user",
-                "kind": "measured" if req.constraints.water_ec_dS_m is not None else "missing"
+                "kind": "user-entered" if req.constraints.water_ec_dS_m is not None else "missing"
             }
         ],
         "indicators": indicators,

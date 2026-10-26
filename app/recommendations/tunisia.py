@@ -30,8 +30,8 @@ def build_recommendations_tn(indicators: dict, constraints: dict, soil: dict | N
     water_rel = constraints.get("water_source_reliability")  # LOW/MEDIUM/HIGH/None
     water_sal_risk = _water_salinity_risk(water_ec)
 
-    lat = (constraints.get("_lat_for_region") or None)  # optional internal
-    is_south_hint = isinstance(lat, (int, float)) and lat < 32.0
+    lat = constraints.get("_lat_for_region")
+    is_south_hint = isinstance(lat, (int, float)) and lat < 34.3
 
     recs: list[dict[str, Any]] = []
 
@@ -293,6 +293,35 @@ def build_recommendations_tn(indicators: dict, constraints: dict, soil: dict | N
             mitigations=["Leaching strategy (if feasible)", "Gypsum when appropriate", "Monitor EC over time"],
             rank_hint=15
         )
+
+    # Stable IDs separate crops from diagnostics; HIGH fit never means high confidence.
+    crop_keys = {"Olive orchard": "olive", "Fig orchard": "fig", "Almond orchard": "almond",
+                 "Pomegranate orchard": "pomegranate", "Date palm (oasis agriculture)": "date_palm"}
+    for rec in recs:
+        rec["crop_key"] = crop_keys.get(rec["activity"])
+        rec["category"] = "crop" if rec["crop_key"] else "management"
+        rec["status"] = "conditional" if rec["crop_key"] else "action"
+        rec["confidence"] = "LOW"
+        rec["missing_inputs"] = ["root_zone_soil", "field_verification"]
+        if irrigation is None:
+            rec["missing_inputs"].append("irrigation_available")
+        if water_ec is None:
+            rec["missing_inputs"].append("water_ec_dS_m")
+        rec["missing_inputs"].append("sustainable_water_volume")
+        rec["rule_score"] = rec["score"]
+        # pH is an explicit screening constraint, not unused request decoration.
+        ph = soil.get("ph") if soil else None
+        limits = {"olive": (5.6, 8.5), "fig": (6.0, 8.5), "almond": (6.0, 8.0),
+                  "pomegranate": (5.5, 8.5), "date_palm": (6.0, 8.8)}
+        if ph is None and rec["crop_key"]:
+            rec["missing_inputs"].append("soil_ph")
+        elif rec["crop_key"] in limits and not limits[rec["crop_key"]][0] <= ph <= limits[rec["crop_key"]][1]:
+            rec["status"] = "not_suitable"
+            rec["fit"] = "LOW"
+            rec["warnings"].append("Soil pH is outside this provisional crop screening range")
+        if irrigation is True and water_rel == "LOW" and rec["crop_key"]:
+            rec["fit"] = "LOW"
+            rec["warnings"].append("A reliable irrigation supply has not been established")
 
     # Sort + ranks
     recs.sort(key=_rank_sort_key)
